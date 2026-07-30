@@ -12,6 +12,7 @@ worker/.wrangler/
 bin/
 cli/hf-save.exe
 cli/hf-save
+cli/hf-save-*
 
 # Environment & Secret files
 .env
