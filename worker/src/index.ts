@@ -362,12 +362,16 @@ app.all("/delete", async (c) => {
 
 // Web UI Dashboard
 app.get("/", (c) => {
+  const host = c.req.header("host") || "localhost";
+  const protocol = c.req.header("x-forwarded-proto") || "https";
+  const serverUrl = `${protocol}://${host}`;
+
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hf-save | Storage Dashboard</title>
+  <title>hf-save | Storage Dashboard & CLI Installer</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -426,6 +430,97 @@ app.get("/", (c) => {
     }
     .hero h1 { font-size: 1.8rem; font-weight: 600; margin-bottom: 0.5rem; }
     .hero p { color: var(--text-muted); font-size: 0.95rem; }
+    
+    .installer-box {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+      backdrop-filter: blur(8px);
+    }
+    .installer-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-bottom: 1.2rem;
+    }
+    .input-label {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    .text-input {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 0.6rem 1rem;
+      color: #fff;
+      font-family: var(--mono-font);
+      font-size: 0.9rem;
+      width: 100%;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .text-input:focus {
+      border-color: var(--accent);
+    }
+    .tab-bar {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 0.8rem;
+    }
+    .tab-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--card-border);
+      color: var(--text-muted);
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .cmd-box {
+      background: #04060a;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 1rem 1.2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      font-family: var(--mono-font);
+      font-size: 0.88rem;
+      color: #38bdf8;
+      overflow-x: auto;
+    }
+    .copy-btn {
+      background: rgba(255, 255, 255, 0.1);
+      border: none;
+      color: #fff;
+      padding: 0.4rem 0.8rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.2s;
+    }
+    .copy-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -491,6 +586,29 @@ app.get("/", (c) => {
       <h1>Snapshot Storage Explorer</h1>
       <p>Ephemeral GPU developer backup & restore backend powered by Cloudflare Workers and Hugging Face Buckets.</p>
     </section>
+
+    <!-- CLI Quick Installer Section -->
+    <div class="installer-box">
+      <div class="installer-title">
+        <span>⚡ Quick CLI Installation Generator</span>
+      </div>
+      <div class="input-group">
+        <label class="input-label" for="keyInput">API Key (HF_SAVE_API_KEY):</label>
+        <input type="text" id="keyInput" class="text-input" placeholder="Enter pre-shared API key (or leave empty)" oninput="updateCmd()" />
+      </div>
+
+      <div class="tab-bar">
+        <button class="tab-btn active" id="tabLinux" onclick="setPlatform('linux')">🐧 Linux (bash)</button>
+        <button class="tab-btn" id="tabMac" onclick="setPlatform('mac')">🍎 macOS (zsh/bash)</button>
+        <button class="tab-btn" id="tabWin" onclick="setPlatform('windows')">🪟 Windows (PowerShell)</button>
+      </div>
+
+      <div class="cmd-box">
+        <code id="cmdText">curl -fsSL "${serverUrl}/init?platform=linux&token=" | bash</code>
+        <button class="copy-btn" onclick="copyCmd()">Copy Command</button>
+      </div>
+    </div>
+
     <div class="grid">
       <div class="card">
         <div class="card-title">Backend Provider</div>
@@ -505,6 +623,7 @@ app.get("/", (c) => {
         <div class="card-val" style="color: #f472b6;">Go</div>
       </div>
     </div>
+
     <div class="explorer">
       <div class="explorer-header">
         <span class="explorer-title">Remote Snapshots & Backups</span>
@@ -516,7 +635,41 @@ app.get("/", (c) => {
       </ul>
     </div>
   </main>
+
   <script>
+    const serverUrl = "${serverUrl}";
+    let currentPlatform = 'linux';
+
+    function setPlatform(p) {
+      currentPlatform = p;
+      document.getElementById('tabLinux').classList.toggle('active', p === 'linux');
+      document.getElementById('tabMac').classList.toggle('active', p === 'mac');
+      document.getElementById('tabWin').classList.toggle('active', p === 'windows');
+      updateCmd();
+    }
+
+    function updateCmd() {
+      const key = encodeURIComponent(document.getElementById('keyInput').value.trim());
+      const cmdEl = document.getElementById('cmdText');
+
+      if (currentPlatform === 'windows') {
+        cmdEl.innerText = \`irm "\${serverUrl}/init?platform=windows&token=\${key}" | iex\`;
+      } else if (currentPlatform === 'mac') {
+        cmdEl.innerText = \`curl -fsSL "\${serverUrl}/init?platform=mac&token=\${key}" | bash\`;
+      } else {
+        cmdEl.innerText = \`curl -fsSL "\${serverUrl}/init?platform=linux&token=\${key}" | bash\`;
+      }
+    }
+
+    function copyCmd() {
+      const cmd = document.getElementById('cmdText').innerText;
+      navigator.clipboard.writeText(cmd).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.innerText = 'Copied!';
+        setTimeout(() => btn.innerText = 'Copy Command', 2000);
+      });
+    }
+
     async function loadFiles() {
       try {
         const res = await fetch('/list');
