@@ -3,9 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2024-09-25"
 compatibility_flags = ["nodejs_compat"]
 
-[vars]
-HF_BUCKET_NAME = ""
-
 # Secrets to configure in Cloudflare dashboard or wrangler:
 # wrangler secret put HF_TOKEN
 # wrangler secret put HF_SAVE_API_KEY
