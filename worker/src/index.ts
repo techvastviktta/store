@@ -171,7 +171,7 @@ app.get("/bin/:platform", async (c) => {
 // Upload Intent Handshake
 app.post("/upload-intent", async (c) => {
   if (!checkAuth(c)) {
-    return c.json({ error: "Unauthorized" }, 401);
+    return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
   }
 
   const tokens = parseTokens(c.env.HF_TOKEN);
@@ -189,7 +189,7 @@ app.post("/upload-intent", async (c) => {
       });
     });
   } catch (e: any) {
-    // Ignore error if dataset repository already exists
+    // Ignore if repository already exists
   }
 
   return c.json({
@@ -200,10 +200,10 @@ app.post("/upload-intent", async (c) => {
   });
 });
 
-// File Upload Proxy (Uploads individual file to HF Dataset/Bucket with multi-account token failover)
+// File Upload Proxy (Uploads individual file to HF Dataset/Bucket with auto repo creation)
 app.post("/upload", async (c) => {
   if (!checkAuth(c)) {
-    return c.json({ error: "Unauthorized" }, 401);
+    return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
   }
 
   const tokens = parseTokens(c.env.HF_TOKEN);
@@ -223,14 +223,36 @@ app.post("/upload", async (c) => {
     const blob = new Blob([arrayBuffer]);
 
     await withHfRetry(tokens, async (token) => {
-      return await uploadFile({
-        repo: { type: "dataset", name: bucketName },
-        accessToken: token,
-        file: {
-          path: filePath,
-          content: blob,
-        },
-      });
+      try {
+        return await uploadFile({
+          repo: { type: "dataset", name: bucketName },
+          accessToken: token,
+          file: {
+            path: filePath,
+            content: blob,
+          },
+        });
+      } catch (err: any) {
+        const errMsg = String(err.message || err);
+        if (errMsg.includes("404") || errMsg.toLowerCase().includes("not found")) {
+          // Auto-create dataset repository if it doesn't exist yet
+          try {
+            await createRepo({
+              repo: { type: "dataset", name: bucketName },
+              accessToken: token,
+            });
+          } catch (_) {}
+          return await uploadFile({
+            repo: { type: "dataset", name: bucketName },
+            accessToken: token,
+            file: {
+              path: filePath,
+              content: blob,
+            },
+          });
+        }
+        throw err;
+      }
     });
 
     return c.json({ success: true, path: filePath });
@@ -258,27 +280,37 @@ app.get("/stats", async (c) => {
   let totalSize = 0;
   let totalFiles = 0;
   const runs = new Set<string>();
+  let isNotFound = false;
 
   try {
     await withHfRetry(tokens, async (token) => {
-      const filesIterable = listFiles({
-        repo: { type: "dataset", name: bucketName },
-        accessToken: token,
-        recursive: true,
-      });
-
       totalSize = 0;
       totalFiles = 0;
       runs.clear();
 
-      for await (const file of filesIterable) {
-        totalFiles++;
-        totalSize += file.size || 0;
-        const parts = file.path.split("/");
-        if (parts.length >= 2) {
-          runs.add(`${parts[0]}/${parts[1]}`);
-        } else if (parts.length === 1) {
-          runs.add(parts[0]);
+      try {
+        const filesIterable = listFiles({
+          repo: { type: "dataset", name: bucketName },
+          accessToken: token,
+          recursive: true,
+        });
+
+        for await (const file of filesIterable) {
+          totalFiles++;
+          totalSize += file.size || 0;
+          const parts = file.path.split("/");
+          if (parts.length >= 2) {
+            runs.add(`${parts[0]}/${parts[1]}`);
+          } else if (parts.length === 1) {
+            runs.add(parts[0]);
+          }
+        }
+      } catch (listErr: any) {
+        const msg = String(listErr.message || listErr);
+        if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
+          isNotFound = true;
+        } else {
+          throw listErr;
         }
       }
     });
@@ -289,7 +321,7 @@ app.get("/stats", async (c) => {
       total_files: totalFiles,
       total_runs: runs.size,
       token_count: tokens.length,
-      status: "Connected",
+      status: isNotFound ? "Connected (Empty Repo)" : "Connected",
     });
   } catch (e: any) {
     return c.json({
@@ -318,41 +350,51 @@ app.get("/list", async (c) => {
     const items: Array<{ name: string; is_dir: boolean; size: number; time: string }> = [];
 
     await withHfRetry(tokens, async (token) => {
-      const filesIterable = listFiles({
-        repo: { type: "dataset", name: bucketName },
-        accessToken: token,
-        path: subPath,
-        recursive: true,
-      });
+      try {
+        const filesIterable = listFiles({
+          repo: { type: "dataset", name: bucketName },
+          accessToken: token,
+          path: subPath,
+          recursive: true,
+        });
 
-      const seenDirs = new Set<string>();
-      const nowIso = new Date().toISOString();
-      items.length = 0;
+        const seenDirs = new Set<string>();
+        const nowIso = new Date().toISOString();
+        items.length = 0;
 
-      for await (const file of filesIterable) {
-        const relPath = subPath ? file.path.substring(subPath.length).replace(/^\//, "") : file.path;
-        if (!relPath) continue;
+        for await (const file of filesIterable) {
+          const relPath = subPath ? file.path.substring(subPath.length).replace(/^\//, "") : file.path;
+          if (!relPath) continue;
 
-        const parts = relPath.split("/");
-        if (parts.length > 1) {
-          const dirName = parts[0];
-          if (!seenDirs.has(dirName)) {
-            seenDirs.add(dirName);
+          const parts = relPath.split("/");
+          if (parts.length > 1) {
+            const dirName = parts[0];
+            if (!seenDirs.has(dirName)) {
+              seenDirs.add(dirName);
+              items.push({
+                name: dirName,
+                is_dir: true,
+                size: 0,
+                time: nowIso,
+              });
+            }
+          } else {
             items.push({
-              name: dirName,
-              is_dir: true,
-              size: 0,
+              name: parts[0],
+              is_dir: false,
+              size: file.size || 0,
               time: nowIso,
             });
           }
-        } else {
-          items.push({
-            name: parts[0],
-            is_dir: false,
-            size: file.size || 0,
-            time: nowIso,
-          });
         }
+      } catch (listErr: any) {
+        const msg = String(listErr.message || listErr);
+        if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
+          // Repo not created yet or path doesn't exist
+          items.length = 0;
+          return;
+        }
+        throw listErr;
       }
     });
 
@@ -383,7 +425,7 @@ app.get("/download", async (c) => {
 // Delete Files / Directories
 app.all("/delete", async (c) => {
   if (!checkAuth(c)) {
-    return c.json({ error: "Unauthorized" }, 401);
+    return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
   }
 
   const tokens = parseTokens(c.env.HF_TOKEN);
@@ -765,8 +807,13 @@ app.get("/", (c) => {
         const data = await res.json();
         
         const bucketEl = document.getElementById('kpiBucket');
-        bucketEl.innerHTML = \`<a href="https://huggingface.co/datasets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
-        document.getElementById('kpiBucketSub').innerText = \`Status: \${data.status || 'Connected'}\`;
+        if (data.error) {
+          bucketEl.innerText = data.bucket_name || 'Error';
+          document.getElementById('kpiBucketSub').innerText = \`Error: \${data.error}\`;
+        } else {
+          bucketEl.innerHTML = \`<a href="https://huggingface.co/datasets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
+          document.getElementById('kpiBucketSub').innerText = \`Status: \${data.status || 'Connected'}\`;
+        }
         
         document.getElementById('kpiSize').innerText = formatBytes(data.total_size_bytes);
         document.getElementById('kpiRuns').innerText = data.total_runs || 0;

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -239,6 +240,28 @@ func saveSingleTarget(cfg Config, target string, customName, tag, customPrefix s
 		return
 	}
 
+	// Handshake: Call /upload-intent to verify Auth and Auto-Create Bucket/Repo
+	intentURL := cfg.ServerURL + "/upload-intent"
+	intentReq, err := http.NewRequest(http.MethodPost, intentURL, bytes.NewBuffer([]byte("{}")))
+	if err == nil {
+		if cfg.APIKey != "" {
+			intentReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		}
+		client := &http.Client{Timeout: 10 * time.Second}
+		intentResp, err := client.Do(intentReq)
+		if err != nil {
+			fmt.Printf("Error connecting to server: %v\n", err)
+			return
+		}
+		body, _ := io.ReadAll(intentResp.Body)
+		intentResp.Body.Close()
+
+		if intentResp.StatusCode != http.StatusOK {
+			fmt.Printf("Error during upload authorization [HTTP %d]: %s\n", intentResp.StatusCode, string(body))
+			return
+		}
+	}
+
 	var filesToUpload []uploadFile
 	if !info.IsDir() {
 		filesToUpload = append(filesToUpload, uploadFile{
@@ -329,14 +352,16 @@ func saveSingleTarget(cfg Config, target string, customName, tag, customPrefix s
 		resp, err := client.Do(req)
 		f.Close()
 
-		if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated) {
+		if err != nil {
+			fmt.Printf("\nUpload error for %s: %v\n", file.relPath, err)
+		} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 			resp.Body.Close()
 			uploadedCount++
 			fmt.Printf("Uploading [%d/%d]: %s\r", i+1, len(filesToUpload), file.relPath)
 		} else {
-			if resp != nil {
-				resp.Body.Close()
-			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			fmt.Printf("\nUpload failed for %s [HTTP %d]: %s\n", file.relPath, resp.StatusCode, string(body))
 		}
 	}
 	fmt.Printf("\nSuccessfully saved %s! (%d/%d files uploaded)\n", target, uploadedCount, len(filesToUpload))
@@ -370,7 +395,7 @@ func runList(args []string) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("Request failed: %s - %s\n", resp.Status, string(body))
+		fmt.Printf("Request failed [HTTP %d]: %s\n", resp.StatusCode, string(body))
 		os.Exit(1)
 	}
 
