@@ -13,6 +13,38 @@ const app = new Hono<{ Bindings: Bindings }>();
 
 app.use("*", cors());
 
+// Helper to parse comma-separated tokens from multiple accounts
+function parseTokens(raw?: string): string[] {
+  if (!raw) return [];
+  let val = raw.trim();
+  if (val.startsWith("[") && val.endsWith("]")) {
+    val = val.substring(1, val.length - 1);
+  }
+  return val
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+// Executes an async HF SDK operation with automatic token failover across accounts
+async function withHfRetry<T>(
+  tokens: string[],
+  operation: (token: string) => Promise<T>
+): Promise<T> {
+  if (tokens.length === 0) {
+    throw new Error("No Hugging Face tokens configured");
+  }
+  let lastError: any = null;
+  for (const token of tokens) {
+    try {
+      return await operation(token);
+    } catch (err: any) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("Operation failed with all configured tokens");
+}
+
 // Helper to check authentication
 function checkAuth(c: any): boolean {
   const apiKey = c.env.HF_SAVE_API_KEY;
@@ -142,17 +174,19 @@ app.post("/upload-intent", async (c) => {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const hfToken = c.env.HF_TOKEN;
+  const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
 
-  if (!hfToken || !bucketName) {
+  if (tokens.length === 0 || !bucketName) {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
   try {
-    await createRepo({
-      repo: { type: "dataset", name: bucketName },
-      accessToken: hfToken,
+    await withHfRetry(tokens, async (token) => {
+      return await createRepo({
+        repo: { type: "dataset", name: bucketName },
+        accessToken: token,
+      });
     });
   } catch (e: any) {
     // Ignore error if dataset repository already exists
@@ -166,16 +200,16 @@ app.post("/upload-intent", async (c) => {
   });
 });
 
-// File Upload Proxy (Uploads individual file to HF Dataset/Bucket)
+// File Upload Proxy (Uploads individual file to HF Dataset/Bucket with multi-account token failover)
 app.post("/upload", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const hfToken = c.env.HF_TOKEN;
+  const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
 
-  if (!hfToken || !bucketName) {
+  if (tokens.length === 0 || !bucketName) {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
@@ -188,13 +222,15 @@ app.post("/upload", async (c) => {
     const arrayBuffer = await c.req.arrayBuffer();
     const blob = new Blob([arrayBuffer]);
 
-    await uploadFile({
-      repo: { type: "dataset", name: bucketName },
-      accessToken: hfToken,
-      file: {
-        path: filePath,
-        content: blob,
-      },
+    await withHfRetry(tokens, async (token) => {
+      return await uploadFile({
+        repo: { type: "dataset", name: bucketName },
+        accessToken: token,
+        file: {
+          path: filePath,
+          content: blob,
+        },
+      });
     });
 
     return c.json({ success: true, path: filePath });
@@ -205,51 +241,55 @@ app.post("/upload", async (c) => {
 
 // List Files & Directories
 app.get("/list", async (c) => {
-  const hfToken = c.env.HF_TOKEN;
+  const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
   const subPath = c.req.query("path") || c.req.query("date") || "";
 
-  if (!hfToken || !bucketName) {
+  if (tokens.length === 0 || !bucketName) {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
   try {
-    const filesIterable = listFiles({
-      repo: { type: "dataset", name: bucketName },
-      accessToken: hfToken,
-      path: subPath,
-      recursive: true,
-    });
-
     const items: Array<{ name: string; is_dir: boolean; size: number; time: string }> = [];
-    const seenDirs = new Set<string>();
-    const nowIso = new Date().toISOString();
 
-    for await (const file of filesIterable) {
-      const relPath = subPath ? file.path.substring(subPath.length).replace(/^\//, "") : file.path;
-      if (!relPath) continue;
+    await withHfRetry(tokens, async (token) => {
+      const filesIterable = listFiles({
+        repo: { type: "dataset", name: bucketName },
+        accessToken: token,
+        path: subPath,
+        recursive: true,
+      });
 
-      const parts = relPath.split("/");
-      if (parts.length > 1) {
-        const dirName = parts[0];
-        if (!seenDirs.has(dirName)) {
-          seenDirs.add(dirName);
+      const seenDirs = new Set<string>();
+      const nowIso = new Date().toISOString();
+      items.length = 0; // Clear array on retry
+
+      for await (const file of filesIterable) {
+        const relPath = subPath ? file.path.substring(subPath.length).replace(/^\//, "") : file.path;
+        if (!relPath) continue;
+
+        const parts = relPath.split("/");
+        if (parts.length > 1) {
+          const dirName = parts[0];
+          if (!seenDirs.has(dirName)) {
+            seenDirs.add(dirName);
+            items.push({
+              name: dirName,
+              is_dir: true,
+              size: 0,
+              time: nowIso,
+            });
+          }
+        } else {
           items.push({
-            name: dirName,
-            is_dir: true,
-            size: 0,
+            name: parts[0],
+            is_dir: false,
+            size: file.size || 0,
             time: nowIso,
           });
         }
-      } else {
-        items.push({
-          name: parts[0],
-          is_dir: false,
-          size: file.size || 0,
-          time: nowIso,
-        });
       }
-    }
+    });
 
     return c.json(items);
   } catch (e: any) {
@@ -259,7 +299,7 @@ app.get("/list", async (c) => {
 
 // Download File
 app.get("/download", async (c) => {
-  const hfToken = c.env.HF_TOKEN;
+  const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
   const filePath = c.req.query("path");
 
@@ -267,7 +307,7 @@ app.get("/download", async (c) => {
     return c.json({ error: "Missing path parameter" }, 400);
   }
 
-  if (!hfToken || !bucketName) {
+  if (tokens.length === 0 || !bucketName) {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
@@ -281,7 +321,7 @@ app.all("/delete", async (c) => {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const hfToken = c.env.HF_TOKEN;
+  const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
   const targetPath = c.req.query("path") || c.req.query("date");
 
@@ -289,27 +329,30 @@ app.all("/delete", async (c) => {
     return c.json({ error: "Missing path parameter" }, 400);
   }
 
-  if (!hfToken || !bucketName) {
+  if (tokens.length === 0 || !bucketName) {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
   try {
-    const filesIterable = listFiles({
-      repo: { type: "dataset", name: bucketName },
-      accessToken: hfToken,
-      path: targetPath,
-      recursive: true,
-    });
-
     let count = 0;
-    for await (const file of filesIterable) {
-      await deleteFile({
+    await withHfRetry(tokens, async (token) => {
+      const filesIterable = listFiles({
         repo: { type: "dataset", name: bucketName },
-        accessToken: hfToken,
-        path: file.path,
+        accessToken: token,
+        path: targetPath,
+        recursive: true,
       });
-      count++;
-    }
+
+      count = 0;
+      for await (const file of filesIterable) {
+        await deleteFile({
+          repo: { type: "dataset", name: bucketName },
+          accessToken: token,
+          path: file.path,
+        });
+        count++;
+      }
+    });
 
     return c.json({ success: true, deleted_count: count });
   } catch (e: any) {
