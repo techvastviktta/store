@@ -1,0 +1,27 @@
+# Node / Cloudflare Worker
+node_modules/
+.wrangler/
+dist/
+worker/node_modules/
+worker/.wrangler/
+
+# Compiled Binaries
+*.exe
+*.bin
+*.out
+bin/
+cli/hf-save.exe
+cli/hf-save
+
+# Environment & Secret files
+.env
+.env.*
+hf-token
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
