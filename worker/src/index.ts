@@ -239,6 +239,71 @@ app.post("/upload", async (c) => {
   }
 });
 
+// Bucket Statistics & Metadata KPI Endpoint
+app.get("/stats", async (c) => {
+  const tokens = parseTokens(c.env.HF_TOKEN);
+  const bucketName = c.env.HF_BUCKET_NAME || "Not Configured";
+
+  if (tokens.length === 0 || !c.env.HF_BUCKET_NAME) {
+    return c.json({
+      bucket_name: bucketName,
+      total_size_bytes: 0,
+      total_files: 0,
+      total_runs: 0,
+      token_count: tokens.length,
+      status: "Secrets Missing",
+    });
+  }
+
+  let totalSize = 0;
+  let totalFiles = 0;
+  const runs = new Set<string>();
+
+  try {
+    await withHfRetry(tokens, async (token) => {
+      const filesIterable = listFiles({
+        repo: { type: "dataset", name: bucketName },
+        accessToken: token,
+        recursive: true,
+      });
+
+      totalSize = 0;
+      totalFiles = 0;
+      runs.clear();
+
+      for await (const file of filesIterable) {
+        totalFiles++;
+        totalSize += file.size || 0;
+        const parts = file.path.split("/");
+        if (parts.length >= 2) {
+          runs.add(`${parts[0]}/${parts[1]}`);
+        } else if (parts.length === 1) {
+          runs.add(parts[0]);
+        }
+      }
+    });
+
+    return c.json({
+      bucket_name: bucketName,
+      total_size_bytes: totalSize,
+      total_files: totalFiles,
+      total_runs: runs.size,
+      token_count: tokens.length,
+      status: "Connected",
+    });
+  } catch (e: any) {
+    return c.json({
+      bucket_name: bucketName,
+      total_size_bytes: 0,
+      total_files: 0,
+      total_runs: 0,
+      token_count: tokens.length,
+      status: "Error",
+      error: e.message,
+    });
+  }
+});
+
 // List Files & Directories
 app.get("/list", async (c) => {
   const tokens = parseTokens(c.env.HF_TOKEN);
@@ -262,7 +327,7 @@ app.get("/list", async (c) => {
 
       const seenDirs = new Set<string>();
       const nowIso = new Date().toISOString();
-      items.length = 0; // Clear array on retry
+      items.length = 0;
 
       for await (const file of filesIterable) {
         const relPath = subPath ? file.path.substring(subPath.length).replace(/^\//, "") : file.path;
@@ -371,7 +436,7 @@ app.get("/", (c) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hf-save | Storage Dashboard & CLI Installer</title>
+  <title>hf-save | Storage Dashboard & Metrics</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -523,7 +588,7 @@ app.get("/", (c) => {
 
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 1.5rem;
       margin-bottom: 2rem;
     }
@@ -535,7 +600,9 @@ app.get("/", (c) => {
       backdrop-filter: blur(8px);
     }
     .card-title { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
-    .card-val { font-size: 1.8rem; font-weight: 700; font-family: var(--mono-font); }
+    .card-val { font-size: 1.6rem; font-weight: 700; font-family: var(--mono-font); overflow: hidden; text-overflow: ellipsis; }
+    .card-sub { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.4rem; }
+
     .explorer {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
@@ -587,6 +654,35 @@ app.get("/", (c) => {
       <p>Ephemeral GPU developer backup & restore backend powered by Cloudflare Workers and Hugging Face Buckets.</p>
     </section>
 
+    <!-- KPI / Metrics Grid -->
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">Connected Bucket</div>
+        <div class="card-val" id="kpiBucket" style="color: #818cf8; font-size: 1.2rem;">Loading...</div>
+        <div class="card-sub" id="kpiBucketSub">Hugging Face Storage</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Total Storage Used</div>
+        <div class="card-val" id="kpiSize" style="color: #34d399;">...</div>
+        <div class="card-sub">Chunk deduplicated (Xet)</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Snapshot Runs</div>
+        <div class="card-val" id="kpiRuns" style="color: #f472b6;">...</div>
+        <div class="card-sub">Active backup sessions</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Total Files</div>
+        <div class="card-val" id="kpiFiles" style="color: #fbbf24;">...</div>
+        <div class="card-sub">Unarchived objects</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Token Pool</div>
+        <div class="card-val" id="kpiTokens" style="color: #a78bfa;">...</div>
+        <div class="card-sub">Account failover pool</div>
+      </div>
+    </div>
+
     <!-- CLI Quick Installer Section -->
     <div class="installer-box">
       <div class="installer-title">
@@ -609,21 +705,6 @@ app.get("/", (c) => {
       </div>
     </div>
 
-    <div class="grid">
-      <div class="card">
-        <div class="card-title">Backend Provider</div>
-        <div class="card-val" style="color: #818cf8;">HF Storage</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Edge Runtime</div>
-        <div class="card-val" style="color: #34d399;">Cloudflare Worker</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Client CLI</div>
-        <div class="card-val" style="color: #f472b6;">Go</div>
-      </div>
-    </div>
-
     <div class="explorer">
       <div class="explorer-header">
         <span class="explorer-title">Remote Snapshots & Backups</span>
@@ -639,6 +720,14 @@ app.get("/", (c) => {
   <script>
     const serverUrl = "${serverUrl}";
     let currentPlatform = 'linux';
+
+    function formatBytes(bytes) {
+      if (!bytes || bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
 
     function setPlatform(p) {
       currentPlatform = p;
@@ -670,6 +759,24 @@ app.get("/", (c) => {
       });
     }
 
+    async function loadStats() {
+      try {
+        const res = await fetch('/stats');
+        const data = await res.json();
+        
+        const bucketEl = document.getElementById('kpiBucket');
+        bucketEl.innerHTML = \`<a href="https://huggingface.co/datasets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
+        document.getElementById('kpiBucketSub').innerText = \`Status: \${data.status || 'Connected'}\`;
+        
+        document.getElementById('kpiSize').innerText = formatBytes(data.total_size_bytes);
+        document.getElementById('kpiRuns').innerText = data.total_runs || 0;
+        document.getElementById('kpiFiles').innerText = data.total_files || 0;
+        document.getElementById('kpiTokens').innerText = \`\${data.token_count || 1} Account\${(data.token_count > 1 ? 's' : '')}\`;
+      } catch (e) {
+        document.getElementById('kpiBucket').innerText = 'Error';
+      }
+    }
+
     async function loadFiles() {
       try {
         const res = await fetch('/list');
@@ -692,6 +799,8 @@ app.get("/", (c) => {
         document.getElementById('files').innerHTML = '<li class="file-item"><div class="file-name">Failed to load snapshots.</div></li>';
       }
     }
+
+    loadStats();
     loadFiles();
   </script>
 </body>
