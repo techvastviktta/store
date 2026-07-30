@@ -184,7 +184,7 @@ app.post("/upload-intent", async (c) => {
   try {
     await withHfRetry(tokens, async (token) => {
       return await createRepo({
-        repo: { type: "dataset", name: bucketName },
+        repo: { type: "bucket" as any, name: bucketName },
         accessToken: token,
       });
     });
@@ -200,7 +200,7 @@ app.post("/upload-intent", async (c) => {
   });
 });
 
-// File Upload Proxy (Uploads individual file to HF Dataset/Bucket with auto repo creation)
+// File Upload Proxy (Uploads individual file to HF Storage Bucket)
 app.post("/upload", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
@@ -225,7 +225,7 @@ app.post("/upload", async (c) => {
     await withHfRetry(tokens, async (token) => {
       try {
         return await uploadFile({
-          repo: { type: "dataset", name: bucketName },
+          repo: { type: "bucket" as any, name: bucketName },
           accessToken: token,
           file: {
             path: filePath,
@@ -235,15 +235,15 @@ app.post("/upload", async (c) => {
       } catch (err: any) {
         const errMsg = String(err.message || err);
         if (errMsg.includes("404") || errMsg.toLowerCase().includes("not found")) {
-          // Auto-create dataset repository if it doesn't exist yet
+          // Auto-create bucket repository if it doesn't exist yet
           try {
             await createRepo({
-              repo: { type: "dataset", name: bucketName },
+              repo: { type: "bucket" as any, name: bucketName },
               accessToken: token,
             });
           } catch (_) {}
           return await uploadFile({
-            repo: { type: "dataset", name: bucketName },
+            repo: { type: "bucket" as any, name: bucketName },
             accessToken: token,
             file: {
               path: filePath,
@@ -290,7 +290,7 @@ app.get("/stats", async (c) => {
 
       try {
         const filesIterable = listFiles({
-          repo: { type: "dataset", name: bucketName },
+          repo: { type: "bucket" as any, name: bucketName },
           accessToken: token,
           recursive: true,
         });
@@ -321,7 +321,7 @@ app.get("/stats", async (c) => {
       total_files: totalFiles,
       total_runs: runs.size,
       token_count: tokens.length,
-      status: isNotFound ? "Connected (Empty Repo)" : "Connected",
+      status: isNotFound ? "Connected (Empty Bucket)" : "Connected",
     });
   } catch (e: any) {
     return c.json({
@@ -352,7 +352,7 @@ app.get("/list", async (c) => {
     await withHfRetry(tokens, async (token) => {
       try {
         const filesIterable = listFiles({
-          repo: { type: "dataset", name: bucketName },
+          repo: { type: "bucket" as any, name: bucketName },
           accessToken: token,
           path: subPath,
           recursive: true,
@@ -390,7 +390,6 @@ app.get("/list", async (c) => {
       } catch (listErr: any) {
         const msg = String(listErr.message || listErr);
         if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
-          // Repo not created yet or path doesn't exist
           items.length = 0;
           return;
         }
@@ -418,7 +417,7 @@ app.get("/download", async (c) => {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
-  const directUrl = `https://huggingface.co/datasets/${bucketName}/resolve/main/${encodeURIComponent(filePath)}`;
+  const directUrl = `https://huggingface.co/buckets/${bucketName}/resolve/main/${encodeURIComponent(filePath)}`;
   return c.redirect(directUrl);
 });
 
@@ -444,7 +443,7 @@ app.all("/delete", async (c) => {
     let count = 0;
     await withHfRetry(tokens, async (token) => {
       const filesIterable = listFiles({
-        repo: { type: "dataset", name: bucketName },
+        repo: { type: "bucket" as any, name: bucketName },
         accessToken: token,
         path: targetPath,
         recursive: true,
@@ -453,7 +452,7 @@ app.all("/delete", async (c) => {
       count = 0;
       for await (const file of filesIterable) {
         await deleteFile({
-          repo: { type: "dataset", name: bucketName },
+          repo: { type: "bucket" as any, name: bucketName },
           accessToken: token,
           path: file.path,
         });
@@ -701,7 +700,7 @@ app.get("/", (c) => {
       <div class="card">
         <div class="card-title">Connected Bucket</div>
         <div class="card-val" id="kpiBucket" style="color: #818cf8; font-size: 1.2rem;">Loading...</div>
-        <div class="card-sub" id="kpiBucketSub">Hugging Face Storage</div>
+        <div class="card-sub" id="kpiBucketSub">Hugging Face Storage Bucket</div>
       </div>
       <div class="card">
         <div class="card-title">Total Storage Used</div>
@@ -811,7 +810,7 @@ app.get("/", (c) => {
           bucketEl.innerText = data.bucket_name || 'Error';
           document.getElementById('kpiBucketSub').innerText = \`Error: \${data.error}\`;
         } else {
-          bucketEl.innerHTML = \`<a href="https://huggingface.co/datasets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
+          bucketEl.innerHTML = \`<a href="https://huggingface.co/buckets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
           document.getElementById('kpiBucketSub').innerText = \`Status: \${data.status || 'Connected'}\`;
         }
         
