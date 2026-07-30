@@ -3,10 +3,19 @@ import { cors } from "hono/cors";
 
 type Bindings = {
   HF_TOKEN?: string;
+  AWS_ACCESS_KEY_ID?: string;
+  AWS_SECRET_ACCESS_KEY?: string;
+  HF_S3_ACCESS_KEY_ID?: string;
+  HF_S3_SECRET_ACCESS_KEY?: string;
   HF_BUCKET_NAME?: string;
   HF_SAVE_API_KEY?: string;
   GITHUB_REPO?: string;
 };
+
+export interface S3Credentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+}
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -25,23 +34,53 @@ function parseTokens(raw?: string): string[] {
     .filter(Boolean);
 }
 
-// Executes an async operation with automatic token failover across accounts
+// Parses paired S3 Access Key ID & Secret Access Key credentials
+function parseS3Credentials(c: any): S3Credentials[] {
+  const keyIds = parseTokens(c.env.AWS_ACCESS_KEY_ID || c.env.HF_S3_ACCESS_KEY_ID);
+  const secrets = parseTokens(c.env.AWS_SECRET_ACCESS_KEY || c.env.HF_S3_SECRET_ACCESS_KEY);
+  const pairs: S3Credentials[] = [];
+
+  const max = Math.max(keyIds.length, secrets.length);
+  for (let i = 0; i < max; i++) {
+    if (keyIds[i] && secrets[i]) {
+      pairs.push({
+        accessKeyId: keyIds[i],
+        secretAccessKey: secrets[i],
+      });
+    }
+  }
+
+  // Fallback to HF_TOKEN if S3 keys not explicitly provided
+  if (pairs.length === 0) {
+    const tokens = parseTokens(c.env.HF_TOKEN);
+    for (const t of tokens) {
+      pairs.push({
+        accessKeyId: t,
+        secretAccessKey: t,
+      });
+    }
+  }
+
+  return pairs;
+}
+
+// Executes an async operation with automatic failover across credential pairs
 async function withHfRetry<T>(
-  tokens: string[],
-  operation: (token: string) => Promise<T>
+  creds: S3Credentials[],
+  operation: (cred: S3Credentials) => Promise<T>
 ): Promise<T> {
-  if (tokens.length === 0) {
-    throw new Error("No Hugging Face tokens configured");
+  if (creds.length === 0) {
+    throw new Error("No Hugging Face S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, or HF_TOKEN) configured");
   }
   let lastError: any = null;
-  for (const token of tokens) {
+  for (const cred of creds) {
     try {
-      return await operation(token);
+      return await operation(cred);
     } catch (err: any) {
       lastError = err;
     }
   }
-  throw lastError || new Error("Operation failed with all configured tokens");
+  throw lastError || new Error("Operation failed with all configured credential accounts");
 }
 
 // Web Crypto Utilities for AWS SigV4
@@ -64,8 +103,8 @@ async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promise<strin
     .join("");
 }
 
-async function getSignatureKey(key: string, dateStamp: string, regionName: string, serviceName: string) {
-  const kDate = await hmacSha256(new TextEncoder().encode("AWS4" + key), dateStamp);
+async function getSignatureKey(secretKey: string, dateStamp: string, regionName: string, serviceName: string) {
+  const kDate = await hmacSha256(new TextEncoder().encode("AWS4" + secretKey), dateStamp);
   const kRegion = await hmacSha256(kDate, regionName);
   const kService = await hmacSha256(kRegion, serviceName);
   const kSigning = await hmacSha256(kService, "aws4_request");
@@ -76,7 +115,7 @@ async function getSignatureKey(key: string, dateStamp: string, regionName: strin
 async function s3SignedFetch(
   method: string,
   urlStr: string,
-  token: string,
+  cred: S3Credentials,
   body?: ArrayBuffer
 ): Promise<Response> {
   const url = new URL(urlStr);
@@ -110,13 +149,13 @@ async function s3SignedFetch(
     `${credentialScope}\n` +
     `${await sha256Hex(canonicalRequest)}`;
 
-  const signingKey = await getSignatureKey(token, dateStamp, region, service);
+  const signingKey = await getSignatureKey(cred.secretAccessKey, dateStamp, region, service);
   const signatureBuffer = await hmacSha256(signingKey, stringToSign);
   const signature = Array.from(new Uint8Array(signatureBuffer))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
-  const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${token}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${cred.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
   const headers: Record<string, string> = {
     Authorization: authorizationHeader,
@@ -135,15 +174,23 @@ async function s3SignedFetch(
   });
 }
 
-// Upload file directly to HF Storage Bucket via REST API or S3 SigV4
-async function uploadToBucket(bucketName: string, filePath: string, token: string, body: ArrayBuffer) {
-  // Method 1: Hugging Face Bucket Native REST API Endpoint
+// Upload file directly to HF Storage Bucket via S3 SigV4 or REST API
+async function uploadToBucket(bucketName: string, filePath: string, cred: S3Credentials, body: ArrayBuffer) {
+  // Method 1: Hugging Face S3 Gateway with AWS SigV4 Signing (Primary for HFAK... S3 Keys)
+  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
+  const s3Resp = await s3SignedFetch("PUT", s3Url, cred, body);
+
+  if (s3Resp.ok) {
+    return true;
+  }
+
+  // Method 2: Hugging Face Bucket Native REST API Endpoint (Fallback for Bearer tokens)
   const restUrl = `https://huggingface.co/api/buckets/${bucketName}/raw/${filePath}`;
   try {
     const restResp = await fetch(restUrl, {
       method: "PUT",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${cred.secretAccessKey}`,
         "Content-Type": "application/octet-stream",
       },
       body: body,
@@ -152,14 +199,6 @@ async function uploadToBucket(bucketName: string, filePath: string, token: strin
       return true;
     }
   } catch (_) {}
-
-  // Method 2: Hugging Face Bucket S3 Gateway SigV4
-  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
-  const s3Resp = await s3SignedFetch("PUT", s3Url, token, body);
-
-  if (s3Resp.ok) {
-    return true;
-  }
 
   const errText = await s3Resp.text();
   throw new Error(`Bucket upload failed [HTTP ${s3Resp.status}]: ${errText || "Error uploading to HF Bucket"}`);
@@ -294,11 +333,11 @@ app.post("/upload-intent", async (c) => {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
   }
 
-  const tokens = parseTokens(c.env.HF_TOKEN);
+  const creds = parseS3Credentials(c);
   const bucketName = c.env.HF_BUCKET_NAME;
 
-  if (tokens.length === 0 || !bucketName) {
-    return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
+  if (creds.length === 0 || !bucketName) {
+    return c.json({ error: "Server missing S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) or HF_BUCKET_NAME secret" }, 500);
   }
 
   return c.json({
@@ -309,17 +348,17 @@ app.post("/upload-intent", async (c) => {
   });
 });
 
-// File Upload Proxy (Uploads individual file to HF Storage Bucket)
+// File Upload Proxy (Uploads individual file to HF Storage Bucket via S3 SigV4)
 app.post("/upload", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
   }
 
-  const tokens = parseTokens(c.env.HF_TOKEN);
+  const creds = parseS3Credentials(c);
   const bucketName = c.env.HF_BUCKET_NAME;
 
-  if (tokens.length === 0 || !bucketName) {
-    return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
+  if (creds.length === 0 || !bucketName) {
+    return c.json({ error: "Server missing S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) or HF_BUCKET_NAME secret" }, 500);
   }
 
   const filePath = c.req.query("path");
@@ -330,8 +369,8 @@ app.post("/upload", async (c) => {
   try {
     const arrayBuffer = await c.req.arrayBuffer();
 
-    await withHfRetry(tokens, async (token) => {
-      return await uploadToBucket(bucketName, filePath, token, arrayBuffer);
+    await withHfRetry(creds, async (cred) => {
+      return await uploadToBucket(bucketName, filePath, cred, arrayBuffer);
     });
 
     return c.json({ success: true, path: filePath });
@@ -342,16 +381,16 @@ app.post("/upload", async (c) => {
 
 // Bucket Statistics & Metadata KPI Endpoint
 app.get("/stats", async (c) => {
-  const tokens = parseTokens(c.env.HF_TOKEN);
+  const creds = parseS3Credentials(c);
   const bucketName = c.env.HF_BUCKET_NAME || "Not Configured";
 
-  if (tokens.length === 0 || !c.env.HF_BUCKET_NAME) {
+  if (creds.length === 0 || !c.env.HF_BUCKET_NAME) {
     return c.json({
       bucket_name: bucketName,
       total_size_bytes: 0,
       total_files: 0,
       total_runs: 0,
-      token_count: tokens.length,
+      token_count: creds.length,
       status: "Secrets Missing",
     });
   }
@@ -361,47 +400,28 @@ app.get("/stats", async (c) => {
   const runs = new Set<string>();
 
   try {
-    await withHfRetry(tokens, async (token) => {
+    await withHfRetry(creds, async (cred) => {
       totalSize = 0;
       totalFiles = 0;
       runs.clear();
 
-      // Try HF Bucket REST API list first
-      const restResp = await fetch(`https://huggingface.co/api/buckets/${bucketName}/files`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, cred);
+      if (resp.ok) {
+        const text = await resp.text();
+        const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
+        const sizeMatches = text.match(/<Size>(.*?)<\/Size>/g) || [];
 
-      if (restResp.ok) {
-        const files = await restResp.json() as any[];
-        for (const file of files) {
+        for (let i = 0; i < keyMatches.length; i++) {
           totalFiles++;
-          totalSize += file.size || 0;
-          const parts = (file.path || file.rpath || "").split("/");
+          const key = keyMatches[i].replace(/<\/?Key>/g, "");
+          const sz = parseInt(sizeMatches[i]?.replace(/<\/?Size>/g, "") || "0", 10);
+          totalSize += sz;
+
+          const parts = key.split("/");
           if (parts.length >= 2) {
             runs.add(`${parts[0]}/${parts[1]}`);
           } else if (parts.length === 1) {
             runs.add(parts[0]);
-          }
-        }
-      } else {
-        const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, token);
-        if (resp.ok) {
-          const text = await resp.text();
-          const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
-          const sizeMatches = text.match(/<Size>(.*?)<\/Size>/g) || [];
-
-          for (let i = 0; i < keyMatches.length; i++) {
-            totalFiles++;
-            const key = keyMatches[i].replace(/<\/?Key>/g, "");
-            const sz = parseInt(sizeMatches[i]?.replace(/<\/?Size>/g, "") || "0", 10);
-            totalSize += sz;
-
-            const parts = key.split("/");
-            if (parts.length >= 2) {
-              runs.add(`${parts[0]}/${parts[1]}`);
-            } else if (parts.length === 1) {
-              runs.add(parts[0]);
-            }
           }
         }
       }
@@ -412,8 +432,8 @@ app.get("/stats", async (c) => {
       total_size_bytes: totalSize,
       total_files: totalFiles,
       total_runs: runs.size,
-      token_count: tokens.length,
-      status: "Connected (HF Bucket API)",
+      token_count: creds.length,
+      status: "Connected (S3 Gateway)",
     });
   } catch (e: any) {
     return c.json({
@@ -421,104 +441,67 @@ app.get("/stats", async (c) => {
       total_size_bytes: 0,
       total_files: 0,
       total_runs: 0,
-      token_count: tokens.length,
+      token_count: creds.length,
       status: "Error",
       error: e.message,
     });
   }
 });
 
-// List Files & Directories via HF Bucket REST API or S3 Gateway
+// List Files & Directories via S3 Gateway
 app.get("/list", async (c) => {
-  const tokens = parseTokens(c.env.HF_TOKEN);
+  const creds = parseS3Credentials(c);
   const bucketName = c.env.HF_BUCKET_NAME;
   const subPath = c.req.query("path") || c.req.query("date") || "";
 
-  if (tokens.length === 0 || !bucketName) {
-    return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
+  if (creds.length === 0 || !bucketName) {
+    return c.json({ error: "Server missing S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) or HF_BUCKET_NAME secret" }, 500);
   }
 
   try {
     const items: Array<{ name: string; is_dir: boolean; size: number; time: string }> = [];
 
-    await withHfRetry(tokens, async (token) => {
-      const restResp = await fetch(`https://huggingface.co/api/buckets/${bucketName}/files`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+    await withHfRetry(creds, async (cred) => {
+      const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, cred);
+      if (!resp.ok) {
+        throw new Error(`S3 Bucket list failed [HTTP ${resp.status}]`);
+      }
 
+      const text = await resp.text();
+      const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
+      const sizeMatches = text.match(/<Size>(.*?)<\/Size>/g) || [];
       const seenDirs = new Set<string>();
       const nowIso = new Date().toISOString();
       items.length = 0;
 
-      if (restResp.ok) {
-        const files = await restResp.json() as any[];
-        for (const file of files) {
-          const fullKey = file.path || file.rpath || "";
-          if (subPath && !fullKey.startsWith(subPath)) continue;
+      for (let i = 0; i < keyMatches.length; i++) {
+        const fullKey = keyMatches[i].replace(/<\/?Key>/g, "");
+        const sz = parseInt(sizeMatches[i]?.replace(/<\/?Size>/g, "") || "0", 10);
 
-          const relPath = subPath ? fullKey.substring(subPath.length).replace(/^\//, "") : fullKey;
-          if (!relPath) continue;
+        if (subPath && !fullKey.startsWith(subPath)) continue;
 
-          const parts = relPath.split("/");
-          if (parts.length > 1) {
-            const dirName = parts[0];
-            if (!seenDirs.has(dirName)) {
-              seenDirs.add(dirName);
-              items.push({
-                name: dirName,
-                is_dir: true,
-                size: 0,
-                time: nowIso,
-              });
-            }
-          } else {
+        const relPath = subPath ? fullKey.substring(subPath.length).replace(/^\//, "") : fullKey;
+        if (!relPath) continue;
+
+        const parts = relPath.split("/");
+        if (parts.length > 1) {
+          const dirName = parts[0];
+          if (!seenDirs.has(dirName)) {
+            seenDirs.add(dirName);
             items.push({
-              name: parts[0],
-              is_dir: false,
-              size: file.size || 0,
+              name: dirName,
+              is_dir: true,
+              size: 0,
               time: nowIso,
             });
           }
-        }
-      } else {
-        const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, token);
-        if (!resp.ok) {
-          throw new Error(`Bucket list failed [HTTP ${resp.status}]`);
-        }
-
-        const text = await resp.text();
-        const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
-        const sizeMatches = text.match(/<Size>(.*?)<\/Size>/g) || [];
-
-        for (let i = 0; i < keyMatches.length; i++) {
-          const fullKey = keyMatches[i].replace(/<\/?Key>/g, "");
-          const sz = parseInt(sizeMatches[i]?.replace(/<\/?Size>/g, "") || "0", 10);
-
-          if (subPath && !fullKey.startsWith(subPath)) continue;
-
-          const relPath = subPath ? fullKey.substring(subPath.length).replace(/^\//, "") : fullKey;
-          if (!relPath) continue;
-
-          const parts = relPath.split("/");
-          if (parts.length > 1) {
-            const dirName = parts[0];
-            if (!seenDirs.has(dirName)) {
-              seenDirs.add(dirName);
-              items.push({
-                name: dirName,
-                is_dir: true,
-                size: 0,
-                time: nowIso,
-              });
-            }
-          } else {
-            items.push({
-              name: parts[0],
-              is_dir: false,
-              size: sz,
-              time: nowIso,
-            });
-          }
+        } else {
+          items.push({
+            name: parts[0],
+            is_dir: false,
+            size: sz,
+            time: nowIso,
+          });
         }
       }
     });
@@ -529,9 +512,9 @@ app.get("/list", async (c) => {
   }
 });
 
-// Download File directly from HF Storage Bucket
+// Download File directly from HF Storage Bucket S3
 app.get("/download", async (c) => {
-  const tokens = parseTokens(c.env.HF_TOKEN);
+  const creds = parseS3Credentials(c);
   const bucketName = c.env.HF_BUCKET_NAME;
   const filePath = c.req.query("path");
 
@@ -539,12 +522,12 @@ app.get("/download", async (c) => {
     return c.json({ error: "Missing path parameter" }, 400);
   }
 
-  if (tokens.length === 0 || !bucketName) {
-    return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
+  if (creds.length === 0 || !bucketName) {
+    return c.json({ error: "Server missing S3 credentials or HF_BUCKET_NAME secret" }, 500);
   }
 
-  const directUrl = `https://huggingface.co/buckets/${bucketName}/resolve/main/${encodeURIComponent(filePath)}`;
-  return c.redirect(directUrl);
+  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
+  return c.redirect(s3Url);
 });
 
 // Delete Files / Directories from HF Storage Bucket
@@ -553,7 +536,7 @@ app.all("/delete", async (c) => {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
   }
 
-  const tokens = parseTokens(c.env.HF_TOKEN);
+  const creds = parseS3Credentials(c);
   const bucketName = c.env.HF_BUCKET_NAME;
   const targetPath = c.req.query("path") || c.req.query("date");
 
@@ -561,44 +544,25 @@ app.all("/delete", async (c) => {
     return c.json({ error: "Missing path parameter" }, 400);
   }
 
-  if (tokens.length === 0 || !bucketName) {
-    return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
+  if (creds.length === 0 || !bucketName) {
+    return c.json({ error: "Server missing S3 credentials or HF_BUCKET_NAME secret" }, 500);
   }
 
   try {
     let count = 0;
-    await withHfRetry(tokens, async (token) => {
-      const restResp = await fetch(`https://huggingface.co/api/buckets/${bucketName}/files`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+    await withHfRetry(creds, async (cred) => {
+      const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, cred);
+      if (!resp.ok) return;
 
-      if (restResp.ok) {
-        const files = await restResp.json() as any[];
-        count = 0;
-        for (const file of files) {
-          const key = file.path || file.rpath || "";
-          if (key.startsWith(targetPath)) {
-            await fetch(`https://huggingface.co/api/buckets/${bucketName}/raw/${encodeURIComponent(key)}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${token}` }
-            });
-            count++;
-          }
-        }
-      } else {
-        const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, token);
-        if (!resp.ok) return;
+      const text = await resp.text();
+      const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
+      count = 0;
 
-        const text = await resp.text();
-        const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
-        count = 0;
-
-        for (const match of keyMatches) {
-          const key = match.replace(/<\/?Key>/g, "");
-          if (key.startsWith(targetPath)) {
-            await s3SignedFetch("DELETE", `https://s3.hf.co/${bucketName}/${key}`, token);
-            count++;
-          }
+      for (const match of keyMatches) {
+        const key = match.replace(/<\/?Key>/g, "");
+        if (key.startsWith(targetPath)) {
+          await s3SignedFetch("DELETE", `https://s3.hf.co/${bucketName}/${key}`, cred);
+          count++;
         }
       }
     });
@@ -861,7 +825,7 @@ app.get("/", (c) => {
         <div class="card-sub">Unarchived objects</div>
       </div>
       <div class="card">
-        <div class="card-title">Token Pool</div>
+        <div class="card-title">S3 Credential Pool</div>
         <div class="card-val" id="kpiTokens" style="color: #a78bfa;">...</div>
         <div class="card-sub">Account failover pool</div>
       </div>
