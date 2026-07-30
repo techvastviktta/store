@@ -45,28 +45,40 @@ async function withHfRetry<T>(
   throw lastError || new Error("Operation failed with all configured tokens");
 }
 
-// Upload file directly to HF Storage Bucket S3 Gateway (https://s3.hf.co/<bucketName>/<filePath>)
-async function uploadToBucket(bucketName: string, filePath: string, token: string, body: ArrayBuffer) {
-  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
-  
-  const s3Resp = await fetch(s3Url, {
-    method: "PUT",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/octet-stream",
-    },
-    body: body,
-  });
-
-  if (s3Resp.ok) {
+// Upload file directly to HF Storage repository using standard HF Token
+async function uploadToHf(bucketName: string, filePath: string, token: string, body: ArrayBuffer) {
+  const blob = new Blob([body]);
+  try {
+    await uploadFile({
+      repo: { type: "dataset", name: bucketName },
+      accessToken: token,
+      file: {
+        path: filePath,
+        content: blob,
+      },
+    });
     return true;
+  } catch (err: any) {
+    const errMsg = String(err.message || err);
+    if (errMsg.includes("404") || errMsg.toLowerCase().includes("not found")) {
+      try {
+        await createRepo({
+          repo: { type: "dataset", name: bucketName },
+          accessToken: token,
+        });
+      } catch (_) {}
+      await uploadFile({
+        repo: { type: "dataset", name: bucketName },
+        accessToken: token,
+        file: {
+          path: filePath,
+          content: blob,
+        },
+      });
+      return true;
+    }
+    throw err;
   }
-
-  const errText = await s3Resp.text();
-  if (s3Resp.status === 404) {
-    throw new Error(`HF Bucket '${bucketName}' not found. Please create your bucket at https://huggingface.co/new-bucket (S3 Status 404: ${errText || 'Not Found'})`);
-  }
-  throw new Error(`S3 Bucket upload failed [HTTP ${s3Resp.status}]: ${errText || 'Upload Error'}`);
 }
 
 // Helper to check authentication
@@ -205,6 +217,17 @@ app.post("/upload-intent", async (c) => {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
+  try {
+    await withHfRetry(tokens, async (token) => {
+      return await createRepo({
+        repo: { type: "dataset", name: bucketName },
+        accessToken: token,
+      });
+    });
+  } catch (e: any) {
+    // Ignore if repository already exists
+  }
+
   return c.json({
     success: true,
     bucket: bucketName,
@@ -213,7 +236,7 @@ app.post("/upload-intent", async (c) => {
   });
 });
 
-// File Upload Proxy (Uploads individual file to HF Storage Bucket)
+// File Upload Proxy (Uploads individual file to HF Storage)
 app.post("/upload", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
@@ -235,7 +258,7 @@ app.post("/upload", async (c) => {
     const arrayBuffer = await c.req.arrayBuffer();
 
     await withHfRetry(tokens, async (token) => {
-      return await uploadToBucket(bucketName, filePath, token, arrayBuffer);
+      return await uploadToHf(bucketName, filePath, token, arrayBuffer);
     });
 
     return c.json({ success: true, path: filePath });
@@ -273,7 +296,7 @@ app.get("/stats", async (c) => {
 
       try {
         const filesIterable = listFiles({
-          repo: { type: "bucket" as any, name: bucketName },
+          repo: { type: "dataset", name: bucketName },
           accessToken: token,
           recursive: true,
         });
@@ -304,7 +327,7 @@ app.get("/stats", async (c) => {
       total_files: totalFiles,
       total_runs: runs.size,
       token_count: tokens.length,
-      status: isNotFound ? "Connected (Empty Bucket)" : "Connected",
+      status: isNotFound ? "Connected (Empty)" : "Connected",
     });
   } catch (e: any) {
     return c.json({
@@ -335,7 +358,7 @@ app.get("/list", async (c) => {
     await withHfRetry(tokens, async (token) => {
       try {
         const filesIterable = listFiles({
-          repo: { type: "bucket" as any, name: bucketName },
+          repo: { type: "dataset", name: bucketName },
           accessToken: token,
           path: subPath,
           recursive: true,
@@ -386,7 +409,7 @@ app.get("/list", async (c) => {
   }
 });
 
-// Download File directly from HF Bucket S3 / Resolve URL
+// Download File directly from HF Storage
 app.get("/download", async (c) => {
   const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
@@ -400,11 +423,11 @@ app.get("/download", async (c) => {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
-  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
-  return c.redirect(s3Url);
+  const directUrl = `https://huggingface.co/datasets/${bucketName}/resolve/main/${encodeURIComponent(filePath)}`;
+  return c.redirect(directUrl);
 });
 
-// Delete Files / Directories from HF Storage Bucket
+// Delete Files / Directories from HF Storage
 app.all("/delete", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
@@ -426,7 +449,7 @@ app.all("/delete", async (c) => {
     let count = 0;
     await withHfRetry(tokens, async (token) => {
       const filesIterable = listFiles({
-        repo: { type: "bucket" as any, name: bucketName },
+        repo: { type: "dataset", name: bucketName },
         accessToken: token,
         path: targetPath,
         recursive: true,
@@ -435,7 +458,7 @@ app.all("/delete", async (c) => {
       count = 0;
       for await (const file of filesIterable) {
         await deleteFile({
-          repo: { type: "bucket" as any, name: bucketName },
+          repo: { type: "dataset", name: bucketName },
           accessToken: token,
           path: file.path,
         });
@@ -675,15 +698,15 @@ app.get("/", (c) => {
   <main>
     <section class="hero">
       <h1>Snapshot Storage Explorer</h1>
-      <p>Ephemeral GPU developer backup & restore backend powered by Cloudflare Workers and Hugging Face Buckets.</p>
+      <p>Ephemeral GPU developer backup & restore backend powered by Cloudflare Workers and Hugging Face Storage.</p>
     </section>
 
     <!-- KPI / Metrics Grid -->
     <div class="grid">
       <div class="card">
-        <div class="card-title">Connected Bucket</div>
+        <div class="card-title">Connected Storage</div>
         <div class="card-val" id="kpiBucket" style="color: #818cf8; font-size: 1.2rem;">Loading...</div>
-        <div class="card-sub" id="kpiBucketSub">Hugging Face Storage Bucket</div>
+        <div class="card-sub" id="kpiBucketSub">Hugging Face Storage Repository</div>
       </div>
       <div class="card">
         <div class="card-title">Total Storage Used</div>
@@ -735,7 +758,7 @@ app.get("/", (c) => {
       </div>
       <ul class="file-list" id="files">
         <li class="file-item">
-          <div class="file-name">Fetching snapshots from Hugging Face Bucket...</div>
+          <div class="file-name">Fetching snapshots from Hugging Face Storage...</div>
         </li>
       </ul>
     </div>
@@ -793,7 +816,7 @@ app.get("/", (c) => {
           bucketEl.innerText = data.bucket_name || 'Error';
           document.getElementById('kpiBucketSub').innerText = \`Error: \${data.error}\`;
         } else {
-          bucketEl.innerHTML = \`<a href="https://huggingface.co/buckets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
+          bucketEl.innerHTML = \`<a href="https://huggingface.co/datasets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
           document.getElementById('kpiBucketSub').innerText = \`Status: \${data.status || 'Connected'}\`;
         }
         
@@ -812,7 +835,7 @@ app.get("/", (c) => {
         const data = await res.json();
         const listEl = document.getElementById('files');
         if (!Array.isArray(data) || data.length === 0) {
-          listEl.innerHTML = '<li class="file-item"><div class="file-name">No snapshot runs found in bucket.</div></li>';
+          listEl.innerHTML = '<li class="file-item"><div class="file-name">No snapshot runs found in storage.</div></li>';
           return;
         }
         listEl.innerHTML = data.map(item => \`
