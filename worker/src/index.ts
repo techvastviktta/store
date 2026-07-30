@@ -9,6 +9,7 @@ type Bindings = {
   HF_S3_SECRET_ACCESS_KEY?: string;
   HF_BUCKET_NAME?: string;
   HF_SAVE_API_KEY?: string;
+  GH_REPO?: string;
   GITHUB_REPO?: string;
 };
 
@@ -314,7 +315,7 @@ echo "Installation successful! Try running: hf-save --help"
 // Serve Binaries via GitHub Release redirect
 app.get("/bin/:platform", async (c) => {
   const target = c.req.param("platform");
-  const repo = c.env.GITHUB_REPO;
+  const repo = c.env.GH_REPO;
 
   if (repo) {
     const releaseUrl = `https://github.com/${repo}/releases/latest/download/${target}`;
@@ -643,7 +644,7 @@ app.get("/", (c) => {
     }
     .hero h1 { font-size: 1.8rem; font-weight: 600; margin-bottom: 0.5rem; }
     .hero p { color: var(--text-muted); font-size: 0.95rem; }
-    
+
     .installer-box {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
@@ -911,7 +912,7 @@ app.get("/", (c) => {
       try {
         const res = await fetch('/stats');
         const data = await res.json();
-        
+
         const bucketEl = document.getElementById('kpiBucket');
         if (data.error) {
           bucketEl.innerText = data.bucket_name || 'Error';
@@ -920,7 +921,7 @@ app.get("/", (c) => {
           bucketEl.innerHTML = \`<a href="https://huggingface.co/buckets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
           document.getElementById('kpiBucketSub').innerText = \`Status: \${data.status || 'Connected'}\`;
         }
-        
+
         document.getElementById('kpiSize').innerText = formatBytes(data.total_size_bytes);
         document.getElementById('kpiRuns').innerText = data.total_runs || 0;
         document.getElementById('kpiFiles').innerText = data.total_files || 0;
