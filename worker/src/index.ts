@@ -45,6 +45,61 @@ async function withHfRetry<T>(
   throw lastError || new Error("Operation failed with all configured tokens");
 }
 
+// Upload file targeting HF Bucket S3 Gateway or HF Dataset Hub API
+async function uploadToHf(bucketName: string, filePath: string, token: string, body: ArrayBuffer) {
+  // Method 1: Hugging Face S3 Bucket Gateway (https://s3.hf.co/<bucketName>/<filePath>)
+  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
+  try {
+    const s3Resp = await fetch(s3Url, {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: body,
+    });
+    if (s3Resp.ok) {
+      return true;
+    }
+  } catch (_) {
+    // Fallthrough to Dataset Hub API
+  }
+
+  // Method 2: Hugging Face Dataset Hub API upload
+  const blob = new Blob([body]);
+  try {
+    await uploadFile({
+      repo: { type: "dataset", name: bucketName },
+      accessToken: token,
+      file: {
+        path: filePath,
+        content: blob,
+      },
+    });
+    return true;
+  } catch (err: any) {
+    const errMsg = String(err.message || err);
+    if (errMsg.includes("404") || errMsg.toLowerCase().includes("not found")) {
+      try {
+        await createRepo({
+          repo: { type: "dataset", name: bucketName },
+          accessToken: token,
+        });
+      } catch (_) {}
+      await uploadFile({
+        repo: { type: "dataset", name: bucketName },
+        accessToken: token,
+        file: {
+          path: filePath,
+          content: blob,
+        },
+      });
+      return true;
+    }
+    throw err;
+  }
+}
+
 // Helper to check authentication
 function checkAuth(c: any): boolean {
   const apiKey = c.env.HF_SAVE_API_KEY;
@@ -184,7 +239,7 @@ app.post("/upload-intent", async (c) => {
   try {
     await withHfRetry(tokens, async (token) => {
       return await createRepo({
-        repo: { type: "bucket" as any, name: bucketName },
+        repo: { type: "dataset", name: bucketName },
         accessToken: token,
       });
     });
@@ -200,7 +255,7 @@ app.post("/upload-intent", async (c) => {
   });
 });
 
-// File Upload Proxy (Uploads individual file to HF Storage Bucket)
+// File Upload Proxy (Uploads individual file to HF Bucket via S3 PUT or Dataset API)
 app.post("/upload", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
@@ -220,39 +275,9 @@ app.post("/upload", async (c) => {
 
   try {
     const arrayBuffer = await c.req.arrayBuffer();
-    const blob = new Blob([arrayBuffer]);
 
     await withHfRetry(tokens, async (token) => {
-      try {
-        return await uploadFile({
-          repo: { type: "bucket" as any, name: bucketName },
-          accessToken: token,
-          file: {
-            path: filePath,
-            content: blob,
-          },
-        });
-      } catch (err: any) {
-        const errMsg = String(err.message || err);
-        if (errMsg.includes("404") || errMsg.toLowerCase().includes("not found")) {
-          // Auto-create bucket repository if it doesn't exist yet
-          try {
-            await createRepo({
-              repo: { type: "bucket" as any, name: bucketName },
-              accessToken: token,
-            });
-          } catch (_) {}
-          return await uploadFile({
-            repo: { type: "bucket" as any, name: bucketName },
-            accessToken: token,
-            file: {
-              path: filePath,
-              content: blob,
-            },
-          });
-        }
-        throw err;
-      }
+      return await uploadToHf(bucketName, filePath, token, arrayBuffer);
     });
 
     return c.json({ success: true, path: filePath });
@@ -290,7 +315,7 @@ app.get("/stats", async (c) => {
 
       try {
         const filesIterable = listFiles({
-          repo: { type: "bucket" as any, name: bucketName },
+          repo: { type: "dataset", name: bucketName },
           accessToken: token,
           recursive: true,
         });
@@ -321,7 +346,7 @@ app.get("/stats", async (c) => {
       total_files: totalFiles,
       total_runs: runs.size,
       token_count: tokens.length,
-      status: isNotFound ? "Connected (Empty Bucket)" : "Connected",
+      status: isNotFound ? "Connected (Empty)" : "Connected",
     });
   } catch (e: any) {
     return c.json({
@@ -352,7 +377,7 @@ app.get("/list", async (c) => {
     await withHfRetry(tokens, async (token) => {
       try {
         const filesIterable = listFiles({
-          repo: { type: "bucket" as any, name: bucketName },
+          repo: { type: "dataset", name: bucketName },
           accessToken: token,
           path: subPath,
           recursive: true,
@@ -417,8 +442,9 @@ app.get("/download", async (c) => {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
-  const directUrl = `https://huggingface.co/buckets/${bucketName}/resolve/main/${encodeURIComponent(filePath)}`;
-  return c.redirect(directUrl);
+  // Try direct S3 bucket URL or dataset URL
+  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
+  return c.redirect(s3Url);
 });
 
 // Delete Files / Directories
@@ -443,7 +469,7 @@ app.all("/delete", async (c) => {
     let count = 0;
     await withHfRetry(tokens, async (token) => {
       const filesIterable = listFiles({
-        repo: { type: "bucket" as any, name: bucketName },
+        repo: { type: "dataset", name: bucketName },
         accessToken: token,
         path: targetPath,
         recursive: true,
@@ -452,7 +478,7 @@ app.all("/delete", async (c) => {
       count = 0;
       for await (const file of filesIterable) {
         await deleteFile({
-          repo: { type: "bucket" as any, name: bucketName },
+          repo: { type: "dataset", name: bucketName },
           accessToken: token,
           path: file.path,
         });
