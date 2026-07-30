@@ -16,12 +16,14 @@ Uses a **Cloudflare Worker** (built with **npm** and **Hono**) as the control pl
 
 2. Configure secrets using **Wrangler**:
    ```bash
-   npx wrangler secret put HF_TOKEN
+   npx wrangler secret put AWS_ACCESS_KEY_ID
+   npx wrangler secret put AWS_SECRET_ACCESS_KEY
    npx wrangler secret put HF_BUCKET_NAME
    npx wrangler secret put HF_SAVE_API_KEY
    ```
-   * `HF_TOKEN`: Your Hugging Face user access token with `write` scope.
-   * `HF_BUCKET_NAME`: Target bucket/dataset repository name (e.g., `username/hf-save-bucket`).
+   * `AWS_ACCESS_KEY_ID`: Your Hugging Face S3 Access Key ID (starts with `HFAK...`, supports comma-separated list for multi-account failover).
+   * `AWS_SECRET_ACCESS_KEY`: Your Hugging Face S3 Secret Access Key (supports comma-separated list).
+   * `HF_BUCKET_NAME`: Target Hugging Face Storage Bucket name (e.g., `xatto/store`).
    * `HF_SAVE_API_KEY`: Secret pre-shared key to authenticate CLI uploads.
 
 3. Deploy the Worker to Cloudflare:
