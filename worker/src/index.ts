@@ -1,6 +1,5 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { createRepo, listFiles, uploadFile, deleteFile } from "@huggingface/hub";
 
 type Bindings = {
   HF_TOKEN?: string;
@@ -26,7 +25,7 @@ function parseTokens(raw?: string): string[] {
     .filter(Boolean);
 }
 
-// Executes an async HF SDK operation with automatic token failover across accounts
+// Executes an async operation with automatic token failover across accounts
 async function withHfRetry<T>(
   tokens: string[],
   operation: (token: string) => Promise<T>
@@ -45,40 +44,108 @@ async function withHfRetry<T>(
   throw lastError || new Error("Operation failed with all configured tokens");
 }
 
-// Upload file directly to HF Storage repository using standard HF Token
-async function uploadToHf(bucketName: string, filePath: string, token: string, body: ArrayBuffer) {
-  const blob = new Blob([body]);
-  try {
-    await uploadFile({
-      repo: { type: "dataset", name: bucketName },
-      accessToken: token,
-      file: {
-        path: filePath,
-        content: blob,
-      },
-    });
-    return true;
-  } catch (err: any) {
-    const errMsg = String(err.message || err);
-    if (errMsg.includes("404") || errMsg.toLowerCase().includes("not found")) {
-      try {
-        await createRepo({
-          repo: { type: "dataset", name: bucketName },
-          accessToken: token,
-        });
-      } catch (_) {}
-      await uploadFile({
-        repo: { type: "dataset", name: bucketName },
-        accessToken: token,
-        file: {
-          path: filePath,
-          content: blob,
-        },
-      });
-      return true;
-    }
-    throw err;
+// Web Crypto Utilities for AWS SigV4
+async function hmacSha256(key: ArrayBuffer | Uint8Array, message: string): Promise<ArrayBuffer> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    key,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  return await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(message));
+}
+
+async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promise<string> {
+  const buf = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function getSignatureKey(key: string, dateStamp: string, regionName: string, serviceName: string) {
+  const kDate = await hmacSha256(new TextEncoder().encode("AWS4" + key), dateStamp);
+  const kRegion = await hmacSha256(kDate, regionName);
+  const kService = await hmacSha256(kRegion, serviceName);
+  const kSigning = await hmacSha256(kService, "aws4_request");
+  return kSigning;
+}
+
+// AWS SigV4 signed HTTP request to Hugging Face S3 Gateway (https://s3.hf.co)
+async function s3SignedFetch(
+  method: string,
+  urlStr: string,
+  token: string,
+  body?: ArrayBuffer
+): Promise<Response> {
+  const url = new URL(urlStr);
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ""); // YYYYMMDDTHHMMSSZ
+  const dateStamp = amzDate.substring(0, 8); // YYYYMMDD
+  const region = "us-east-1";
+  const service = "s3";
+
+  const payloadHash = body ? await sha256Hex(body) : await sha256Hex("");
+
+  const canonicalHeaders =
+    `host:${url.host}\n` +
+    `x-amz-content-sha256:${payloadHash}\n` +
+    `x-amz-date:${amzDate}\n`;
+
+  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+
+  const canonicalRequest =
+    `${method.toUpperCase()}\n` +
+    `${url.pathname}\n` +
+    `${url.search.length > 0 ? url.search.substring(1) : ""}\n` +
+    `${canonicalHeaders}\n` +
+    `${signedHeaders}\n` +
+    `${payloadHash}`;
+
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign =
+    `AWS4-HMAC-SHA256\n` +
+    `${amzDate}\n` +
+    `${credentialScope}\n` +
+    `${await sha256Hex(canonicalRequest)}`;
+
+  const signingKey = await getSignatureKey(token, dateStamp, region, service);
+  const signatureBuffer = await hmacSha256(signingKey, stringToSign);
+  const signature = Array.from(new Uint8Array(signatureBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${token}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const headers: Record<string, string> = {
+    Authorization: authorizationHeader,
+    "x-amz-date": amzDate,
+    "x-amz-content-sha256": payloadHash,
+  };
+
+  if (body) {
+    headers["Content-Type"] = "application/octet-stream";
   }
+
+  return await fetch(urlStr, {
+    method,
+    headers,
+    body: body || null,
+  });
+}
+
+// Upload file directly to HF Storage Bucket via S3 SigV4
+async function uploadToBucketS3(bucketName: string, filePath: string, token: string, body: ArrayBuffer) {
+  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
+  const resp = await s3SignedFetch("PUT", s3Url, token, body);
+
+  if (resp.ok) {
+    return true;
+  }
+
+  const errText = await resp.text();
+  throw new Error(`S3 Bucket upload failed [HTTP ${resp.status}]: ${errText || "Error"}`);
 }
 
 // Helper to check authentication
@@ -217,17 +284,6 @@ app.post("/upload-intent", async (c) => {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
-  try {
-    await withHfRetry(tokens, async (token) => {
-      return await createRepo({
-        repo: { type: "dataset", name: bucketName },
-        accessToken: token,
-      });
-    });
-  } catch (e: any) {
-    // Ignore if repository already exists
-  }
-
   return c.json({
     success: true,
     bucket: bucketName,
@@ -236,7 +292,7 @@ app.post("/upload-intent", async (c) => {
   });
 });
 
-// File Upload Proxy (Uploads individual file to HF Storage)
+// File Upload Proxy (Uploads individual file to HF Storage Bucket via S3 SigV4)
 app.post("/upload", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
@@ -258,7 +314,7 @@ app.post("/upload", async (c) => {
     const arrayBuffer = await c.req.arrayBuffer();
 
     await withHfRetry(tokens, async (token) => {
-      return await uploadToHf(bucketName, filePath, token, arrayBuffer);
+      return await uploadToBucketS3(bucketName, filePath, token, arrayBuffer);
     });
 
     return c.json({ success: true, path: filePath });
@@ -286,7 +342,6 @@ app.get("/stats", async (c) => {
   let totalSize = 0;
   let totalFiles = 0;
   const runs = new Set<string>();
-  let isNotFound = false;
 
   try {
     await withHfRetry(tokens, async (token) => {
@@ -294,29 +349,24 @@ app.get("/stats", async (c) => {
       totalFiles = 0;
       runs.clear();
 
-      try {
-        const filesIterable = listFiles({
-          repo: { type: "dataset", name: bucketName },
-          accessToken: token,
-          recursive: true,
-        });
+      const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, token);
+      if (resp.ok) {
+        const text = await resp.text();
+        const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
+        const sizeMatches = text.match(/<Size>(.*?)<\/Size>/g) || [];
 
-        for await (const file of filesIterable) {
+        for (let i = 0; i < keyMatches.length; i++) {
           totalFiles++;
-          totalSize += file.size || 0;
-          const parts = file.path.split("/");
+          const key = keyMatches[i].replace(/<\/?Key>/g, "");
+          const sz = parseInt(sizeMatches[i]?.replace(/<\/?Size>/g, "") || "0", 10);
+          totalSize += sz;
+
+          const parts = key.split("/");
           if (parts.length >= 2) {
             runs.add(`${parts[0]}/${parts[1]}`);
           } else if (parts.length === 1) {
             runs.add(parts[0]);
           }
-        }
-      } catch (listErr: any) {
-        const msg = String(listErr.message || listErr);
-        if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
-          isNotFound = true;
-        } else {
-          throw listErr;
         }
       }
     });
@@ -327,7 +377,7 @@ app.get("/stats", async (c) => {
       total_files: totalFiles,
       total_runs: runs.size,
       token_count: tokens.length,
-      status: isNotFound ? "Connected (Empty)" : "Connected",
+      status: "Connected (S3 Gateway)",
     });
   } catch (e: any) {
     return c.json({
@@ -342,7 +392,7 @@ app.get("/stats", async (c) => {
   }
 });
 
-// List Files & Directories
+// List Files & Directories via S3 XML Gateway
 app.get("/list", async (c) => {
   const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
@@ -356,50 +406,47 @@ app.get("/list", async (c) => {
     const items: Array<{ name: string; is_dir: boolean; size: number; time: string }> = [];
 
     await withHfRetry(tokens, async (token) => {
-      try {
-        const filesIterable = listFiles({
-          repo: { type: "dataset", name: bucketName },
-          accessToken: token,
-          path: subPath,
-          recursive: true,
-        });
+      const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, token);
+      if (!resp.ok) {
+        throw new Error(`S3 list failed [HTTP ${resp.status}]`);
+      }
 
-        const seenDirs = new Set<string>();
-        const nowIso = new Date().toISOString();
-        items.length = 0;
+      const text = await resp.text();
+      const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
+      const sizeMatches = text.match(/<Size>(.*?)<\/Size>/g) || [];
+      const seenDirs = new Set<string>();
+      const nowIso = new Date().toISOString();
+      items.length = 0;
 
-        for await (const file of filesIterable) {
-          const relPath = subPath ? file.path.substring(subPath.length).replace(/^\//, "") : file.path;
-          if (!relPath) continue;
+      for (let i = 0; i < keyMatches.length; i++) {
+        const fullKey = keyMatches[i].replace(/<\/?Key>/g, "");
+        const sz = parseInt(sizeMatches[i]?.replace(/<\/?Size>/g, "") || "0", 10);
 
-          const parts = relPath.split("/");
-          if (parts.length > 1) {
-            const dirName = parts[0];
-            if (!seenDirs.has(dirName)) {
-              seenDirs.add(dirName);
-              items.push({
-                name: dirName,
-                is_dir: true,
-                size: 0,
-                time: nowIso,
-              });
-            }
-          } else {
+        if (subPath && !fullKey.startsWith(subPath)) continue;
+
+        const relPath = subPath ? fullKey.substring(subPath.length).replace(/^\//, "") : fullKey;
+        if (!relPath) continue;
+
+        const parts = relPath.split("/");
+        if (parts.length > 1) {
+          const dirName = parts[0];
+          if (!seenDirs.has(dirName)) {
+            seenDirs.add(dirName);
             items.push({
-              name: parts[0],
-              is_dir: false,
-              size: file.size || 0,
+              name: dirName,
+              is_dir: true,
+              size: 0,
               time: nowIso,
             });
           }
+        } else {
+          items.push({
+            name: parts[0],
+            is_dir: false,
+            size: sz,
+            time: nowIso,
+          });
         }
-      } catch (listErr: any) {
-        const msg = String(listErr.message || listErr);
-        if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
-          items.length = 0;
-          return;
-        }
-        throw listErr;
       }
     });
 
@@ -409,7 +456,7 @@ app.get("/list", async (c) => {
   }
 });
 
-// Download File directly from HF Storage
+// Download File directly from HF Storage Bucket S3
 app.get("/download", async (c) => {
   const tokens = parseTokens(c.env.HF_TOKEN);
   const bucketName = c.env.HF_BUCKET_NAME;
@@ -423,11 +470,11 @@ app.get("/download", async (c) => {
     return c.json({ error: "Server missing HF_TOKEN or HF_BUCKET_NAME secret" }, 500);
   }
 
-  const directUrl = `https://huggingface.co/datasets/${bucketName}/resolve/main/${encodeURIComponent(filePath)}`;
-  return c.redirect(directUrl);
+  const s3Url = `https://s3.hf.co/${bucketName}/${filePath}`;
+  return c.redirect(s3Url);
 });
 
-// Delete Files / Directories from HF Storage
+// Delete Files / Directories from HF Storage Bucket via S3 SigV4
 app.all("/delete", async (c) => {
   if (!checkAuth(c)) {
     return c.json({ error: "Unauthorized: Invalid or missing API Key" }, 401);
@@ -448,21 +495,19 @@ app.all("/delete", async (c) => {
   try {
     let count = 0;
     await withHfRetry(tokens, async (token) => {
-      const filesIterable = listFiles({
-        repo: { type: "dataset", name: bucketName },
-        accessToken: token,
-        path: targetPath,
-        recursive: true,
-      });
+      const resp = await s3SignedFetch("GET", `https://s3.hf.co/${bucketName}`, token);
+      if (!resp.ok) return;
 
+      const text = await resp.text();
+      const keyMatches = text.match(/<Key>(.*?)<\/Key>/g) || [];
       count = 0;
-      for await (const file of filesIterable) {
-        await deleteFile({
-          repo: { type: "dataset", name: bucketName },
-          accessToken: token,
-          path: file.path,
-        });
-        count++;
+
+      for (const match of keyMatches) {
+        const key = match.replace(/<\/?Key>/g, "");
+        if (key.startsWith(targetPath)) {
+          await s3SignedFetch("DELETE", `https://s3.hf.co/${bucketName}/${key}`, token);
+          count++;
+        }
       }
     });
 
@@ -698,15 +743,15 @@ app.get("/", (c) => {
   <main>
     <section class="hero">
       <h1>Snapshot Storage Explorer</h1>
-      <p>Ephemeral GPU developer backup & restore backend powered by Cloudflare Workers and Hugging Face Storage.</p>
+      <p>Ephemeral GPU developer backup & restore backend powered by Cloudflare Workers and Hugging Face Storage Buckets.</p>
     </section>
 
     <!-- KPI / Metrics Grid -->
     <div class="grid">
       <div class="card">
-        <div class="card-title">Connected Storage</div>
+        <div class="card-title">Connected Bucket</div>
         <div class="card-val" id="kpiBucket" style="color: #818cf8; font-size: 1.2rem;">Loading...</div>
-        <div class="card-sub" id="kpiBucketSub">Hugging Face Storage Repository</div>
+        <div class="card-sub" id="kpiBucketSub">Hugging Face Storage Bucket</div>
       </div>
       <div class="card">
         <div class="card-title">Total Storage Used</div>
@@ -758,7 +803,7 @@ app.get("/", (c) => {
       </div>
       <ul class="file-list" id="files">
         <li class="file-item">
-          <div class="file-name">Fetching snapshots from Hugging Face Storage...</div>
+          <div class="file-name">Fetching snapshots from Hugging Face Storage Bucket...</div>
         </li>
       </ul>
     </div>
@@ -816,7 +861,7 @@ app.get("/", (c) => {
           bucketEl.innerText = data.bucket_name || 'Error';
           document.getElementById('kpiBucketSub').innerText = \`Error: \${data.error}\`;
         } else {
-          bucketEl.innerHTML = \`<a href="https://huggingface.co/datasets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
+          bucketEl.innerHTML = \`<a href="https://huggingface.co/buckets/\${data.bucket_name}" target="_blank" style="color:inherit; text-decoration:underline;">\${data.bucket_name}</a>\`;
           document.getElementById('kpiBucketSub').innerText = \`Status: \${data.status || 'Connected'}\`;
         }
         
@@ -835,7 +880,7 @@ app.get("/", (c) => {
         const data = await res.json();
         const listEl = document.getElementById('files');
         if (!Array.isArray(data) || data.length === 0) {
-          listEl.innerHTML = '<li class="file-item"><div class="file-name">No snapshot runs found in storage.</div></li>';
+          listEl.innerHTML = '<li class="file-item"><div class="file-name">No snapshot runs found in bucket.</div></li>';
           return;
         }
         listEl.innerHTML = data.map(item => \`
